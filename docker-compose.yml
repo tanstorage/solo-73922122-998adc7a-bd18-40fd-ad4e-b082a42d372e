@@ -1,0 +1,24 @@
+services:
+  lakehouse:
+    build: .
+    image: lakehouse-merge:1.0.0
+    container_name: lakehouse-merge
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      MAX_UPLOAD_BYTES: "8388608"      # 8 MiB
+      DEFAULT_PAGE_LIMIT: "1000"
+      AUTO_MERGE_ON_START: "false"
+    volumes:
+      - lakehouse-data:/data
+    # 不用 restart 策略，方便演示“切换/回收中退出后重启”的恢复流程
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  lakehouse-data:
