@@ -10,6 +10,8 @@ services:
       MAX_UPLOAD_BYTES: "8388608"      # 8 MiB
       DEFAULT_PAGE_LIMIT: "1000"
       AUTO_MERGE_ON_START: "false"
+      UPLOAD_STAGE_WORKERS: "4"        # 上传暂存线程池大小
+      UPLOAD_STAGE_DELAY_SECONDS: "0"  # 演示用：>0 模拟慢校验/慢磁盘
     volumes:
       - lakehouse-data:/data
     # 不用 restart 策略，方便演示“切换/回收中退出后重启”的恢复流程

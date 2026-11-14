@@ -1,9 +1,12 @@
 """FastAPI 入口：上传、分页、合并、游标生命周期。"""
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
@@ -12,6 +15,14 @@ from . import config, cursors, storage
 from .db import LOCK, get_conn, next_file_seq
 from .merger import MergeConflict, manager
 from .storage import ParquetValidationError
+
+# 上传暂存专用线程池：Parquet 校验/规范化/写 tmp 是 CPU+IO 密集操作，
+# 全部放到这里执行，事件循环全程自由；与 anyio 默认线程池（同步端点用）
+# 相互隔离，上传风暴不会挤占 /health、游标分页等请求。
+_STAGE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=config.UPLOAD_STAGE_WORKERS,
+    thread_name_prefix="upload-stage",
+)
 
 
 @contextlib.asynccontextmanager
@@ -22,9 +33,11 @@ async def lifespan(_app: FastAPI):
         auto_merge=config.AUTO_MERGE_ON_START
     )
     yield
-    # 关停：等待后台合并线程退出
+    # 关停：等待后台合并线程退出；排队中的暂存任务取消，运行中的随进程退出，
+    # 遗留的 tmp 半成品由下次启动恢复清理
     for t in list(manager._threads.values()):  # noqa: SLF001
         t.join(timeout=5)
+    _STAGE_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 
 app = FastAPI(
@@ -63,12 +76,109 @@ def health() -> dict:
 
 # ------------------------------- 上传 -------------------------------
 
-@app.post("/uploads", tags=["upload"], summary="追加上传一份 Parquet（≤8MiB）")
+def _cleanup_unregistered_tmp(fut: "asyncio.Future") -> None:
+    """暂存线程跑完但请求已被取消：删除永远不会被登记的临时文件。"""
+    try:
+        _table, _row_count, tmp_path = fut.result()
+    except Exception:
+        # 暂存失败：validate_and_stage 内部已保证不留 tmp 半成品
+        return
+    with contextlib.suppress(OSError):
+        os.remove(tmp_path)
+
+
+def _silence_future(fut: "asyncio.Future") -> None:
+    """取回后台 future 的异常，避免事件循环记录“异常未被取回”告警。"""
+    if not fut.cancelled():
+        fut.exception()
+
+
+def _register_staged_file(
+    tmp_path: str, row_count: int, cancel_event: threading.Event
+) -> dict | None:
+    """把暂存文件登记为正式文件（在上传线程池线程中执行）。
+
+    整个临界区在进程锁内原子完成：
+    - 请求已取消且登记尚未生效：不登记，清理 tmp，返回 None；
+    - 否则 os.replace + 元数据事务一次提交，文件立即可读；
+      事务失败回滚并清理，绝不留下半成品。
+    """
+    conn = get_conn()
+    with LOCK:
+        if cancel_event.is_set():
+            # 取消抢先到达：未登记的文件不得稍后自行发布
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+            return None
+        seq = next_file_seq(conn)
+        # 新文件的读取位置排在所有现存文件之后
+        max_order = conn.execute(
+            "SELECT COALESCE(MAX(read_order), -1) AS m FROM files"
+        ).fetchone()["m"]
+        read_order = max_order + 1
+        file_uid = uuid.uuid4().hex
+        final_name = f"{seq:012d}-{file_uid}.parquet"
+        final_path = os.path.join(config.FILES_DIR, final_name)
+        os.replace(tmp_path, final_path)
+        size = os.path.getsize(final_path)
+        try:
+            conn.execute(
+                """INSERT INTO files
+                   (file_id, kind, path, size_bytes, row_count, seq_order,
+                    read_order, status)
+                   VALUES (?, 'upload', ?, ?, ?, ?, ?, 'active')""",
+                (file_uid, final_path, size, row_count, seq, read_order),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            with contextlib.suppress(OSError):
+                os.remove(final_path)
+            raise
+    return {
+        "file_id": file_uid,
+        "seq_order": seq,
+        "read_order": read_order,
+        "size_bytes": size,
+        "row_count": row_count,
+    }
+
+
+def _client_gone_response() -> JSONResponse:
+    # 客户端已断开，响应无法送达；499 语义仅供服务端日志与测试观察
+    return JSONResponse(
+        status_code=499, content={"detail": "客户端已断开，上传未登记"}
+    )
+
+
+@app.post(
+    "/uploads",
+    tags=["upload"],
+    summary="追加上传一份 Parquet（≤8MiB）",
+    openapi_extra={
+        # 让 Swagger UI 渲染文件选择器，/docs 里可直接上传二进制 Parquet
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/vnd.apache.parquet": {
+                    "schema": {"type": "string", "format": "binary"}
+                },
+                "application/octet-stream": {
+                    "schema": {"type": "string", "format": "binary"}
+                },
+            },
+        }
+    },
+)
 async def upload_parquet(request: Request) -> dict:
     """按字节流式接收，超过 8MiB 立即拒绝（413），不落盘多余字节。
 
-    校验固定三列并规范化后写入 files/，元数据在事务中登记；
-    合并进行中也可以正常上传，新文件不会被进行中的合并吞掉。
+    校验/规范化/暂存与正式登记都在上传线程池中执行，慢处理期间
+    /health、游标分页和其他上传照常响应。请求在暂存期间被取消时，
+    未登记的文件不会稍后自行发布，临时文件由回调清理；取消与登记
+    相撞时，登记临界区原子地完成——已提交文件完整可读，未提交文件
+    不出现在清单中。合并进行中也可以正常上传，新文件不会被进行中
+    的合并吞掉。
     """
     chunks: list[bytes] = []
     total = 0
@@ -94,46 +204,93 @@ async def upload_parquet(request: Request) -> dict:
             status_code=422, content={"detail": "上传体为空"}
         )
 
-    # CPU/IO 部分在线程池外直接做（单进程，锁内时间很短）
-    table, row_count, tmp_path = storage.validate_and_stage(data)
+    loop = asyncio.get_running_loop()
 
-    conn = get_conn()
-    with LOCK:
-        seq = next_file_seq(conn)
-        # 新文件的读取位置排在所有现存文件之后
-        max_order = conn.execute(
-            "SELECT COALESCE(MAX(read_order), -1) AS m FROM files"
-        ).fetchone()["m"]
-        read_order = max_order + 1
-        file_uid = uuid.uuid4().hex
-        final_name = f"{seq:012d}-{file_uid}.parquet"
-        final_path = os.path.join(config.FILES_DIR, final_name)
-        os.replace(tmp_path, final_path)
-        size = os.path.getsize(final_path)
+    # 断开监听：uvicorn 不会主动取消处理中的协程，客户端断开只能通过
+    # receive() 返回 http.disconnect 感知。body 已读完，此监听与后续的
+    # 暂存/登记等待竞速；框架直接取消协程（CancelledError）的情形同样覆盖。
+    disconnect_event = asyncio.Event()
+
+    async def _watch_disconnect() -> None:
+        while True:
+            try:
+                message = await request.receive()
+            except Exception:  # noqa: BLE001 - 接收通道异常：放弃监听，不影响主流程
+                return
+            if message["type"] == "http.disconnect":
+                disconnect_event.set()
+                return
+
+    watcher = asyncio.create_task(_watch_disconnect())
+    try:
+        # ---- 暂存：线程池执行，事件循环不被校验/写盘阻塞 ----
+        stage_future = loop.run_in_executor(
+            _STAGE_EXECUTOR, storage.validate_and_stage, data
+        )
+        stage_disconnect = asyncio.create_task(disconnect_event.wait())
         try:
-            conn.execute(
-                """INSERT INTO files
-                   (file_id, kind, path, size_bytes, row_count, seq_order,
-                    read_order, status)
-                   VALUES (?, 'upload', ?, ?, ?, ?, ?, 'active')""",
-                (file_uid, final_path, size, row_count, seq, read_order),
+            await asyncio.wait(
+                [stage_future, stage_disconnect],
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            if os.path.exists(final_path):
-                os.remove(final_path)
+        except asyncio.CancelledError:
+            # 协程被服务器/框架取消：后台线程不可取消，跑完后由回调
+            # 删除未登记的 tmp；文件绝不进入登记流程
+            stage_future.add_done_callback(_cleanup_unregistered_tmp)
             raise
+        finally:
+            stage_disconnect.cancel()
+        if disconnect_event.is_set():
+            # 暂存期间客户端断开：不登记；tmp 由回调在线程跑完后清理
+            stage_future.add_done_callback(_cleanup_unregistered_tmp)
+            return _client_gone_response()
+        table, row_count, tmp_path = stage_future.result()
 
-    return {
-        "file_id": file_uid,
-        "seq_order": seq,
-        "read_order": read_order,
-        "size_bytes": size,
-        "row_count": row_count,
-        "columns": list(table.column_names),
-        "status": "active",
-    }
+        # ---- 登记：原子临界区，同样移出事件循环 ----
+        cancel_event = threading.Event()
+        if disconnect_event.is_set():
+            # 暂存完成后、登记启动前发现客户端已断开
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+            return _client_gone_response()
+        register_future = loop.run_in_executor(
+            _STAGE_EXECUTOR,
+            _register_staged_file,
+            tmp_path,
+            row_count,
+            cancel_event,
+        )
+        register_disconnect = asyncio.create_task(disconnect_event.wait())
+        try:
+            await asyncio.wait(
+                [register_future, register_disconnect],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            # 通知登记线程：尚未生效的登记必须放弃并清理 tmp；
+            # 已开始的登记不可打断，会原子地提交或放弃
+            cancel_event.set()
+            register_future.add_done_callback(_silence_future)
+            raise
+        finally:
+            register_disconnect.cancel()
+        if disconnect_event.is_set():
+            # 取消与登记相撞：登记线程原子地提交（文件完整可读）
+            # 或放弃（不出现在清单中），绝不留下半成品
+            cancel_event.set()
+            register_future.add_done_callback(_silence_future)
+            return _client_gone_response()
+        registered = register_future.result()
+        if registered is None:
+            # 登记线程发现请求已取消而放弃（防御性分支）
+            return _client_gone_response()
+        return {
+            **registered,
+            "columns": list(table.column_names),
+            "status": "active",
+        }
+    finally:
+        watcher.cancel()
 
 
 @app.get("/files", tags=["upload"], summary="查看文件清单（含合并产物与 obsolete 状态）")

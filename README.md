@@ -8,6 +8,8 @@ Parquet 小文件合并为单个 Parquet，降低下游分析的文件打开开�
 | 需求 | 实现方式 |
 | --- | --- |
 | 追加上传，每份 ≤ 8MiB，固定三列 | `POST /uploads` 按字节流式接收，超限立即 413；校验并规范化为 `station_id(string)` / `observed_at(timestamp[us, UTC])` / `temperature(float64)`，缺列、多列、空表、非 Parquet 一律 422 |
+| 慢校验/慢暂存不阻塞其他请求 | 校验、规范化、写 tmp 与正式登记全部放到上传专用线程池（`UPLOAD_STAGE_WORKERS`），事件循环全程自由；慢处理期间 `/health`、游标分页、其他上传照常响应 |
+| 上传取消不留半成品 | 断开监听（`http.disconnect`）与协程取消双路径覆盖：暂存期间取消则文件绝不登记、tmp 由回调清理；取消与登记相撞时登记临界区原子完成——已提交文件完整可读，未提交文件不出现在清单中 |
 | 按上传顺序 + 文件内行序分页，保留重复行 | 全局 `read_order` 决定文件次序，游标在文件内按偏移顺序读，全程不去重 |
 | 游标固定创建时已提交的行 | 创建游标时把当时所有 `active` 文件快照写入 `cursor_files`，之后新上传/合并产物都不会进入旧游标 |
 | 后台把“开始时”的文件合成一个 Parquet，同期只合并一次 | 合并启动瞬间捕获输入清单（`merge_files`），进行中的合并不吞新文件；存在活动任务时再次启动返回 409 |
@@ -84,14 +86,25 @@ DATA_DIR=$DATA_DIR python scripts/demo.py fail-demo
 ## 测试
 
 ```bash
-pip install -r requirements.txt pytest
-pytest            # 9 个用例：校验/分页边界/快照/合并/回收/故障/重启恢复
+pip install -r requirements.txt -r requirements-dev.txt
+pytest            # 16 个用例：校验/分页边界/快照/合并/回收/故障/重启恢复
+                  # + 慢暂存不阻塞事件循环、双路径取消（http.disconnect 与
+                  #   协程取消）、取消与登记相撞的原子性、并发上传行序
 ```
 
 ## 关键设计说明
 
 - **单进程 + 一把可重入锁**：所有元数据写事务、Parquet 读取与旧文件删除都在
   `app.db.LOCK` 保护下，配合 SQLite WAL，杜绝“游标正在读的文件被回收”。
+- **上传不阻塞事件循环**：Parquet 校验/规范化/写 tmp 与正式登记都在上传专用
+  线程池执行（与 anyio 同步端点线程池隔离），`/health`、分页、并发上传在慢
+  暂存期间照常响应；`UPLOAD_STAGE_DELAY_SECONDS` 可人为注入慢处理用于演示
+  与回归测试。
+- **取消安全**：uvicorn 不会主动取消处理中的协程，因此端点在暂存/登记等待时
+  同时监听 `http.disconnect`（并兼容框架直接取消协程的 `CancelledError`）。
+  暂存期间取消：后台线程跑完后由回调删除 tmp，文件绝不登记。登记是锁内原子
+  临界区：取消先到则放弃并清理 tmp，登记先到则完整提交——已提交文件完整可读，
+  未提交文件不出现在清单中。
 - **原子切换**：合并产物先写 `tmp/` 并通过完整性校验，再 `os.replace` 落位，
   最后在一个 SQLite 事务里插入新产物 + 旧文件置 obsolete；事务失败自动回滚并退回产物。
 - **崩溃安全**：所有进度（合并输入、游标位置、文件状态）在每页/每输入文件处理后

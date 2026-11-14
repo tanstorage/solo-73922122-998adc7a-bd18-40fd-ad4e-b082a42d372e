@@ -1,7 +1,9 @@
 """Parquet 读写：上传校验/规范化、分页读取、流式合并。"""
 from __future__ import annotations
 
+import contextlib
 import os
+import time
 import uuid
 from typing import Iterator
 
@@ -77,7 +79,14 @@ def _canonical_table(table: pa.Table) -> pa.Table:
 
 
 def validate_and_stage(data: bytes) -> tuple[pa.Table, int, str]:
-    """校验上传字节流并规范化后落到 tmp，返回(规范化表, 行数, tmp路径)。"""
+    """校验上传字节流并规范化后落到 tmp，返回(规范化表, 行数, tmp路径)。
+
+    本函数在上传线程池线程中执行（CPU/IO 密集），不得阻塞事件循环；
+    任何失败都保证不留下 tmp 半成品。
+    """
+    if config.UPLOAD_STAGE_DELAY_SECONDS > 0:
+        # 演示/测试钩子：模拟慢校验/慢磁盘（只占用线程池线程）
+        time.sleep(config.UPLOAD_STAGE_DELAY_SECONDS)
     try:
         table = pq.read_table(pa.BufferReader(data))
     except Exception as exc:  # noqa: BLE001 - pyarrow 的异常类型很多
@@ -87,7 +96,13 @@ def validate_and_stage(data: bytes) -> tuple[pa.Table, int, str]:
     tmp_name = f"upload-{uuid.uuid4().hex}.parquet.tmp"
     os.makedirs(config.TMP_DIR, exist_ok=True)
     tmp_path = os.path.join(config.TMP_DIR, tmp_name)
-    pq.write_table(table, tmp_path, compression="snappy")
+    try:
+        pq.write_table(table, tmp_path, compression="snappy")
+    except Exception:
+        # 写盘中途失败不能留下半成品临时文件
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
     return table, table.num_rows, tmp_path
 
 

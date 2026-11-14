@@ -18,4 +18,11 @@ AUTO_MERGE_ON_START = os.environ.get("AUTO_MERGE_ON_START", "false").lower() == 
 DEFAULT_PAGE_LIMIT = int(os.environ.get("DEFAULT_PAGE_LIMIT", "1000"))
 MAX_PAGE_LIMIT = int(os.environ.get("MAX_PAGE_LIMIT", "100000"))
 
+# 上传暂存线程池大小：Parquet 校验/规范化/写 tmp 在该池中执行，
+# 避免阻塞 FastAPI 事件循环（/health、分页、其他上传不受影响）
+UPLOAD_STAGE_WORKERS = int(os.environ.get("UPLOAD_STAGE_WORKERS", "4"))
+
+# 演示/测试钩子：暂存处理的人为延迟秒数（0=关闭），模拟慢校验/慢磁盘
+UPLOAD_STAGE_DELAY_SECONDS = float(os.environ.get("UPLOAD_STAGE_DELAY_SECONDS", "0"))
+
 CANONICAL_COLUMNS = ("station_id", "observed_at", "temperature")
